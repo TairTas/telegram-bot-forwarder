@@ -1,105 +1,78 @@
-import asyncio
-import logging
 import os
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties
-from aiogram.filters import Command
+import logging
+import requests
+import json
+
+# --- КОНСТАНТЫ (ВАШИ ЗНАЧЕНИЯ) ---
+# Токен вашего бота.
+BOT_TOKEN = '7648623138:AAFyF0GENQmf4N9h9AInhh1c-hIwuOLkdi4' 
+
+# ID целевого канала или чата (используйте числовое значение с минусом).
+TARGET_CHAT_ID = -1003165019626
+
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-# --- КОНСТАНТЫ (ВАШИ ДАННЫЕ) ------------------------------
-TOKEN = '7648623138:AAFyF0GENQmf4N9h9AInhh1c-hIwuOLkdi4' 
-OWNER_ID = 1949782369 
-CHANNEL_ID = -1003165019626 
-# --------------------------------------------------------------------------
-
-# --- ОБРАБОТЧИК ДЛЯ КОМАНДЫ /start ---
-
-async def cmd_start_handler(message: types.Message):
+# --- ГЛАВНАЯ ФУНКЦИЯ ДЛЯ CLOUD FUNCTION ---
+def run_forwarder(request):
     """
-    Обработчик команды /start.
+    Эта функция вызывается по HTTP-запросу из Google Cloud Functions.
+    Она однократно проверяет пропущенные сообщения (через getUpdates)
+    и пересылает их в целевой канал, после чего завершается.
     """
-    await message.answer("Привет! Отправь мне сообщение, и я перешлю его пользователю.")
-
-
-# --- ОСНОВНОЙ ОБРАБОТЧИК ДЛЯ СООБЩЕНИЙ ---
-
-async def handle_student_message(message: types.Message, bot: Bot):
-    """
-    Обрабатывает входящее сообщение, отправляет лог владельцу и контент в канал.
-    """
-    user = message.from_user
+    logging.info("--- STARTING FORWARDER FUNCTION ---")
     
-    # 1. Сбор и форматирование информации о пользователе (ЛОГ)
-    log_info = (
-        "<b>\u26a0\ufe0f НОВОЕ СООБЩЕНИЕ ОТ ПОЛЬЗОВАТЕЛЯ \u26a0\ufe0f</b>\n"
-        f"<b>ID:</b> <code>{user.id}</code>\n"
-        f"<b>Имя:</b> {user.first_name}\n"
-        f"<b>Юзернейм:</b> @{user.username}" if user.username else "Нет юзернейма"
-    )
-
-    message_content = ""
-    # Определяем тип контента для лога
-    if message.text:
-        message_content = f"\n\n<b>СОДЕРЖАНИЕ ТЕКСТА:</b>\n{message.html_text}"
-    elif message.caption:
-        message_content = f"\n\n<b>ПОДПИСЬ:</b>\n{message.caption}"
-    else:
-        # Если это медиа без подписи или другой тип
-        message_content = f"\n\n<b>СОДЕРЖАНИЕ:</b> (Тип: {message.content_type.name})"
-        
-    full_log = log_info + message_content
-    
-    # 2. Отправка полного лога владельцу
+    # 1. Получаем пропущенные обновления (сообщения)
     try:
-        await bot.send_message(OWNER_ID, full_log, parse_mode=ParseMode.HTML)
-    except Exception as e:
-        logging.error(f"Не удалось отправить лог владельцу {OWNER_ID}: {e}")
+        response = requests.get(f"{TELEGRAM_API_URL}/getUpdates")
+        response.raise_for_status()
+        updates = response.json().get('result', [])
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Ошибка при запросе getUpdates: {e}")
+        return f"Ошибка API Telegram: {e}", 500
+
+    if not updates:
+        logging.info("Нет пропущенных сообщений для пересылки. Завершение.")
+        return "Нет пропущенных сообщений для пересылки."
+
+    processed_count = 0
+    
+    # 2. Обрабатываем и пересылаем каждое сообщение
+    for update in updates:
+        message = update.get('message')
+        if not message:
+            continue
         
-    # 3. ОТПРАВКА КОНТЕНТА В КАНАЛ
-    try:
-        await message.copy_to(
-            chat_id=CHANNEL_ID, 
-            caption_entities=message.caption_entities
-        )
+        # Получаем текст сообщения
+        text_to_forward = message.get('text')
         
-        # 4. Уведомление пользователя (Исправлено: "передано пользователю")
-        # Если сообщение пришло от владельца (для тестирования), не отвечаем ему же.
-        if message.from_user.id != OWNER_ID:
-            await message.answer("Ваше сообщение получено и передано пользователю.")
-        
-    except Exception as e:
-        logging.error(f"Ошибка отправки сообщения в канал {CHANNEL_ID}. Проверьте права бота. Ошибка: {e}")
-        if message.from_user.id != OWNER_ID:
-             await message.answer("Произошла ошибка при отправке сообщения. Пожалуйста, сообщите об этом пользователю.")
+        # Проверяем, есть ли текст для пересылки
+        if text_to_forward:
+            try:
+                # Отправляем сообщение в целевой канал
+                send_response = requests.post(
+                    f"{TELEGRAM_API_URL}/sendMessage",
+                    json={
+                        'chat_id': TARGET_CHAT_ID,
+                        'text': text_to_forward
+                    }
+                )
+                send_response.raise_for_status()
+                processed_count += 1
+                logging.info(f"Переслано сообщение: '{text_to_forward[:30]}...'")
 
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Ошибка при пересылке сообщения: {e}")
+                # Продолжаем обработку, даже если одно сообщение не отправилось
 
-# --- ОСНОВНАЯ ФУНКЦИЯ ЗАПУСКА ---
+    # 3. Очищаем очередь, чтобы эти сообщения больше не попадали в getUpdates
+    if updates:
+        last_update_id = updates[-1]['update_id']
+        # Отправляем getUpdates с offset, чтобы подтвердить, что мы обработали все до этого ID
+        requests.get(f"{TELEGRAM_API_URL}/getUpdates?offset={last_update_id + 1}")
+        logging.info(f"Очередь сообщений очищена до update_id: {last_update_id}")
 
-async def main():
-    
-    # Создаем объекты Bot и Dispatcher
-    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher()
-    
-    # 1. Регистрируем команду /start
-    dp.message.register(cmd_start_handler, Command("start"))
-
-    # 2. Регистрируем основной обработчик для всех входящих сообщений
-    dp.message.register(handle_student_message) 
-    
-    print("Бот запущен на aiogram (v3.x)...")
-    
-    # Запускаем опрос, игнорируя старые обновления.
-    await dp.start_polling(bot, skip_updates=True)
-
-
-if __name__ == '__main__':
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Бот остановлен вручную.")
-    except Exception as e:
-        logging.error(f"Критическая ошибка запуска: {e}")
+    logging.info(f"--- ENDING FORWARDER FUNCTION: Успешно обработано {processed_count} сообщений ---")
+    return f"Успешно обработано и переслано {processed_count} сообщений."
